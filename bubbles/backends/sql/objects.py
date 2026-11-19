@@ -253,6 +253,34 @@ class SQLDataStore(DataStore):
         self.metadata = sqlalchemy.MetaData(bind=self.connectable)
         self.schema = schema
         self.logger = get_logger()
+        self._closed = False
+
+    def close(self):
+        """Releases the store's connectable when it was created by the store
+        itself. A connectable (engine or connection) supplied by the caller is
+        borrowed and left untouched. Safe to call repeatedly. Disposes also
+        the shared default-store pool entry, so a later
+        :func:`default_store` call opens a fresh store instead of reusing a
+        disposed one."""
+        if self._closed:
+            return
+        self._closed = True
+
+        if not self.should_close:
+            return
+
+        # Remove every pool key that points at this store before disposing,
+        # otherwise the disposed engine would be handed out again.
+        stale = [key for key, store in _default_stores.items()
+                 if store is self]
+        for key in stale:
+            del _default_stores[key]
+
+        try:
+            self.connectable.dispose()
+        except AttributeError:
+            # Connections do not have dispose(); the owner is responsible.
+            pass
 
     def clone(self, schema=None, concrete_type_map=None):
         store = SQLDataStore(connectable=self.connectable,
@@ -462,6 +490,15 @@ class SQLDataObject(DataObject):
     def is_consumable(self):
         return False
 
+    def _check_open(self):
+        """Raises when the managed execution is closed or when the backing
+        store itself has been closed."""
+        super(SQLDataObject, self)._check_open()
+        if getattr(self.store, "_closed", False):
+            raise ClosedObjectError(
+                "Can not use data object '%s': its SQL store is closed."
+                % (getattr(self, "name", self), ))
+
     def clone_statement(self, statement=None, fields=None):
         """Clone statement representation from the receiver. If `statement` or
         `fields` are not specified, then they are copied from the receiver.
@@ -475,6 +512,11 @@ class SQLDataObject(DataObject):
         fields = fields or self.fields.clone()
         obj = SQLStatement(statement, self.store, fields=fields,
                                     schema=self.schema)
+        # Derived objects share the same run and must be gated/released
+        # together. The shared store is de-duplicated inside manage().
+        execution = self._managed_execution
+        if execution is not None:
+            execution.manage(obj)
         return obj
 
 class SQLStatement(SQLDataObject):
@@ -527,18 +569,28 @@ class SQLStatement(SQLDataObject):
                                 "as target object" % self.name)
     def __len__(self):
         """Returns number of rows selected by the statement."""
+        self._check_open()
         cnt = sqlalchemy.sql.func.count(1)
         statement = sql.expression.select([cnt], from_obj=self.statement)
 
         return self.store.connectable.scalar(statement)
 
     def rows(self):
-        return iter(self.store.execute(self.statement))
+        self._check_open()
+        cursor = self.store.execute(self.statement)
+        execution = self._managed_execution
+        if execution is not None:
+            # The execution owns the cursor's lifetime; rows are still read
+            # lazily by the consumer.
+            return execution.iter_cursor(cursor)
+        return iter(cursor)
 
     def selectable(self):
+        self._check_open()
         return self.statement
 
     def sql_statement(self):
+        self._check_open()
         return self.statement
 
     def representations(self):
@@ -652,34 +704,45 @@ class SQLTable(SQLDataObject):
         # SQL Statement representation
 
     def rows(self):
-        return iter(self.table.select().execute())
+        self._check_open()
+        cursor = self.table.select().execute()
+        execution = self._managed_execution
+        if execution is not None:
+            return execution.iter_cursor(cursor)
+        return iter(cursor)
 
     def representations(self):
         """Return list of possible object representations"""
         return ["sql_table", "sql", "records", "rows"]
 
     def selectable(self):
+        self._check_open()
         return self.table.select()
 
     def sql_statement(self):
+        self._check_open()
         return self.table
 
     def sql_table(self):
+        self._check_open()
         return self.table
 
     def __len__(self):
         """Returns number of rows in a table"""
+        self._check_open()
         statement = self.table.count()
         result = self.store.connectable.scalar(statement)
         return result
 
     def truncate(self):
+        self._check_open()
         if self.table is None:
             raise RepresentationError("Can not truncate: "
                                       "SQL object is a statement not a table")
         self.store.execute(self.table.delete())
 
     def append(self, row):
+        self._check_open()
         # FIXME: remove this once SQLAlchemy will allow list based multi-insert
         row = dict(zip(self._field_names, row))
 
@@ -688,6 +751,7 @@ class SQLTable(SQLDataObject):
             self.flush()
 
     def flush(self):
+        self._check_open()
         if self._insert_buffer:
             self.store.execute(self.insert_statement, self._insert_buffer)
             self._insert_buffer = []
@@ -711,6 +775,7 @@ class SQLTable(SQLDataObject):
         """
 
         # TODO: depreciate this in favor of the insert() operation
+        self._check_open()
         reprs = obj.representations()
 
         if self.can_compose(obj):

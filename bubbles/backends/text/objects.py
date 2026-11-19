@@ -159,7 +159,16 @@ class CSVSource(DataObject):
         # TODO: use default type converters
         self.type_converters = type_converters or {}
 
-        self.resource = Resource(resource, encoding=self.encoding)
+        # A file-like object is treated as a *borrowed* handle: the source
+        # must not close it, neither on release() nor when a managed
+        # execution ends. Paths and URLs are opened (and therefore owned) by
+        # the resource itself.
+        if hasattr(resource, "read"):
+            self.resource = Resource(url=getattr(resource, "name", None),
+                                     handle=resource,
+                                     encoding=self.encoding)
+        else:
+            self.resource = Resource(resource, encoding=self.encoding)
         self.handle = self.resource.open()
 
         options = dict(options) if options else {}
@@ -207,6 +216,9 @@ class CSVSource(DataObject):
             self.converters = None
 
     def release(self):
+        """Releases the underlying resource. Safe to call repeatedly. Only
+        resources opened by this source are closed; borrowed file handles are
+        left for their owner to close."""
         if self.resource:
             self.resource.close()
 
@@ -214,9 +226,20 @@ class CSVSource(DataObject):
         return ["csv", "rows", "records"]
 
     def rows(self):
+        self._check_open()
         missing_values = [f.missing_value for f in self.fields]
+        reader = self.reader
 
-        for row in self.reader:
+        while True:
+            # Check before every fetch so that closing the execution mid-way
+            # through iteration raises a clean ClosedObjectError rather than
+            # leaking a low-level closed-file error.
+            self._check_open()
+            try:
+                row = next(reader)
+            except StopIteration:
+                return
+
             result = []
 
             for i, value in enumerate(row):
@@ -237,11 +260,20 @@ class CSVSource(DataObject):
             yield result
 
     def csv_stream(self):
+        self._check_open()
         return self.handle
 
     def records(self):
+        self._check_open()
         fields = self.fields.names()
-        for row in self.reader:
+        reader = self.reader
+
+        while True:
+            self._check_open()
+            try:
+                row = next(reader)
+            except StopIteration:
+                return
             yield dict(zip(fields, row))
 
     def is_consumable(self):
@@ -302,12 +334,20 @@ class CSVTarget(DataObject):
         self.fields = fields
         self.kwds = kwds
 
-        self.close_file = False
         self.handle = None
+        self.resource = None
 
         mode = "w" if self.truncate else "a"
 
-        self.handle = open(resource, mode=mode, encoding=encoding)
+        # A file-like object is a *borrowed* handle: the target flushes it but
+        # never closes it. A path is opened by the target itself, so the
+        # handle becomes owned and finalize() closes it.
+        if hasattr(resource, "write"):
+            self._owns_handle = False
+            self.handle = resource
+        else:
+            self._owns_handle = True
+            self.handle = open(resource, mode=mode, encoding=encoding)
 
         self.writer = csv.writer(self.handle, dialect=self.dialect, **self.kwds)
 
@@ -317,14 +357,33 @@ class CSVTarget(DataObject):
             self.writer.writerow(self.fields.names())
 
         self.field_names = self.fields.names()
+        self._finalized = False
+
+    def flush(self):
+        """Flushes buffered data to the underlying handle."""
+        self._check_open()
+        if self.handle:
+            self.handle.flush()
 
     def finalize(self):
+        """Flushes and – for handles opened by the target – closes the file.
+        Idempotent: repeated calls do nothing. Borrowed handles are flushed
+        only and left open for their owner."""
+        if self._finalized:
+            return
+
         if self.handle:
-            self.handle.close()
+            self.handle.flush()
+            if self._owns_handle:
+                self.handle.close()
+
+        self._finalized = True
 
     def append(self, row):
+        self._check_open()
         self.writer.writerow(row)
 
     def append_from(self, obj):
+        self._check_open()
         for row in obj:
             self.append(row)

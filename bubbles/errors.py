@@ -71,6 +71,22 @@ class RepresentationError(DataObjectError):
     representation"""
     pass
 
+class ClosedObjectError(DataObjectError):
+    """Raised when trying to read from or load into an object whose managed
+    execution has already been closed. Plain row values that were already
+    materialized remain usable."""
+    pass
+
+class ResourceCleanupError(BubblesError):
+    """Raised when one or more errors occur while releasing resources owned by
+    a managed execution. The original (processing) error, if any, is kept as
+    the exception cause; the individual cleanup errors are in :attr:`errors`
+    so that both processing and cleanup failures stay visible."""
+
+    def __init__(self, message, errors=None):
+        super(ResourceCleanupError, self).__init__(message)
+        self.errors = list(errors or [])
+
 #
 # Operations errors
 #

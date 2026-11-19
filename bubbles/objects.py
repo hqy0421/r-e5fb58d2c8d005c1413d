@@ -46,6 +46,21 @@ class DataObject(Extensible):
     __extension_type__ = "object"
     __extension_suffix__ = "Object"
 
+    # Set by a managed execution (see bubbles.execution.managed) when the
+    # object participates in one. ``None`` means the object is unmanaged and
+    # keeps its historical behaviour.
+    _managed_execution = None
+
+    def _check_open(self):
+        """Raises :class:`~bubbles.errors.ClosedObjectError` when the object
+        belongs to a managed execution that has already been closed. Objects
+        without a managed execution are always considered open."""
+        execution = self._managed_execution
+        if execution is not None and execution.closed:
+            raise ClosedObjectError(
+                "Can not use data object '%s': its managed execution "
+                "is already closed." % (self, ))
+
     def representations(self):
         """Returns list of representation names of this data object. Default
         implementation raises an exception, as subclasses are required to

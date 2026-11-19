@@ -1,6 +1,43 @@
 Changes in Bubbles
 ==================
 
+Unreleased
+==========
+
+New Features
+------------
+
+* New managed execution entry point `bubbles.execution.ManagedExecution`
+  (and the `managed()` convenience factory / context manager) that owns the
+  resources of one CSV/SQLite cleaning or loading run: opened sources, SQL
+  cursors/stores and output targets.
+* Managed data objects keep their original fields, representations and lazy
+  `rows()`/`records()` behaviour – results are never fully listed. Resources
+  stay open after the builder returns and are flushed/finalized then released
+  only when the execution completes successfully; on failure or early close
+  the owned resources are reclaimed without finalizing outputs.
+* Processing and cleanup errors are both visible: cleanup failures raise
+  `ResourceCleanupError` (carrying every individual error in `errors`) with
+  the processing error kept as the exception cause.
+* Once an execution is closed, every registered object – including derived
+  SQL statements and loading paths – raises the new `ClosedObjectError` on
+  further reads or loads; plain row values already taken out remain usable.
+* Borrowed file handles and caller-supplied SQLAlchemy connectables are
+  tracked separately from owned resources and are never closed (outputs are
+  only flushed). Shared stores and multiple objects derived from one source
+  are registered once and released once.
+
+Changes
+-------
+
+* `Resource` now distinguishes handles it opened itself from handles passed
+  in by the caller; only owned handles are closed by `Resource.close()`.
+* `CSVSource`/`CSVTarget` accept file-like objects as borrowed handles.
+  `CSVTarget.finalize()` is idempotent and gains a `flush()` method.
+* `SQLDataStore.close()` disposes only engines created by the store and
+  removes the disposed store from the shared default-store pool; borrowed
+  connectables are left untouched.
+
 0.2
 ===
 

@@ -46,7 +46,7 @@ class Resource(ContextDecorator):
         self.reader = None
 
         if not opener:
-            if is_local(url):
+            if url is not None and is_local(url):
                 self.opener = None
             else:
                 self.opener = urllib.request.urlopen
@@ -56,12 +56,18 @@ class Resource(ContextDecorator):
             self.opener = opener
 
         self.handle = handle
+        # Only handles that the resource opens itself are owned. A handle
+        # passed in by the caller is borrowed and must never be closed here.
+        self._owns_handle = False
 
     # should_close can't go in the constructor, since later calling open() may
     # implicitly change its value
     @property
     def should_close(self):
-        return self.handle is not None
+        """``True`` for a handle that this resource opened and therefore owns.
+        Borrowed handles (passed in via the constructor) are not owned and are
+        left untouched by :meth:`close`."""
+        return self.handle is not None and self._owns_handle
 
     def open(self):
         if self.handle:
@@ -72,6 +78,7 @@ class Resource(ContextDecorator):
         else:
             mode = "rb" if self.binary else "r"
             self.handle = open(self.url, mode=mode, encoding=self.encoding)
+        self._owns_handle = True
         if self.reader:
             self.handle = self.reader(self.handle)
 
@@ -80,6 +87,7 @@ class Resource(ContextDecorator):
     def close(self):
         if self.should_close:
             self.handle.close()
+            self._owns_handle = False
 
     def __enter__(self):
         return self.open()
